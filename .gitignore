@@ -1,0 +1,27 @@
+# Visual Studio
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.pdb
+*.exe
+
+# NuGet packages
+packages/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+gestos_env310/
+mp_env/
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
