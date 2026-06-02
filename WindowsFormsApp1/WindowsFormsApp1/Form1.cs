@@ -1,18 +1,20 @@
 ﻿using csDronLink;
-using OpenCvSharp;
-using OpenCvSharp.Extensions;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Speech.Recognition;
+using System.Speech.Synthesis;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
 // >>> WEBRTC
 using Microsoft.Web.WebView2.WinForms;
+using Microsoft.Web.WebView2.Core;
 using System.Diagnostics;
 
 // >>> MQTT
@@ -46,23 +48,41 @@ namespace WindowsFormsApp1
         // Evita iniciar dos veces server/publisher si se pulsa varias veces
         private bool webRtcIniciandose = false;
 
+        // Evita iniciar dos grabaciones de vídeo al mismo tiempo
+        private bool grabandoVideo = false;
+
+        // Ruta temporal usada por WebView2 cuando JavaScript descarga el WebM generado
+        private string rutaDescargaWebmPendiente = null;
+
+        // >>> VOZ
+        private SpeechRecognitionEngine recognizer;
+        private SpeechSynthesizer voz = new SpeechSynthesizer();
+        private bool vozActiva = false;
+
+        private bool hablando = false;
+        private bool esperandoConfirmacion = false;
+        private ResultadoConversacion ordenPendienteConfirmacion = null;
+
+        // Filtro para evitar dobles detecciones muy seguidas
+        private string ultimaFrase = "";
+        private DateTime ultimaFraseTiempo = DateTime.MinValue;
+
+        private const float CONFIANZA_MINIMA_COMANDO = 0.30f;
+        private const float CONFIANZA_MINIMA_DICTADO = 0.55f;
+
+
         public Form1()
         {
             InitializeComponent();
             CheckForIllegalCrossThreadCalls = false;
 
-            // Crear WebView2 en el mismo sitio que pictureBoxPC
-            webViewRTC = new WebView2();
-            webViewRTC.Left = pictureBoxPC.Left;
-            webViewRTC.Top = pictureBoxPC.Top;
-            webViewRTC.Width = pictureBoxPC.Width;
-            webViewRTC.Height = pictureBoxPC.Height;
-            webViewRTC.Anchor = pictureBoxPC.Anchor;
-
-            this.Controls.Add(webViewRTC);
-            webViewRTC.BringToFront();
+            CrearWebViewRtc();
 
             this.Load += Form1_Load;
+
+            voz.Rate = 0;
+            voz.SetOutputToDefaultAudioDevice();
+            voz.SpeakCompleted += Voz_SpeakCompleted;
         }
 
         private async void Form1_Load(object sender, EventArgs e)
@@ -72,11 +92,488 @@ namespace WindowsFormsApp1
             try
             {
                 await webViewRTC.EnsureCoreWebView2Async();
+                webViewRTC.CoreWebView2.DownloadStarting += WebViewRTC_DownloadStarting;
                 webViewRTC.Source = new Uri("about:blank");
             }
             catch (Exception ex)
             {
                 AñadirLog("⚠️ Error inicializando WebView2: " + ex.Message);
+            }
+
+            ActualizarEstadoVoz("Voz: desactivada", Color.FromArgb(255, 213, 79));
+            ActualizarBotonVoz(false);
+            ActualizarEstadoModo("Modo: preparado");
+        }
+
+        // =========================================================
+        //                 WEBVIEW2 / ESTADOS DE INTERFAZ
+        // =========================================================
+
+        private void CrearWebViewRtc()
+        {
+            webViewRTC = new WebView2();
+
+            webViewRTC.Left = pictureBoxPC.Left;
+            webViewRTC.Top = pictureBoxPC.Top;
+            webViewRTC.Width = pictureBoxPC.Width;
+            webViewRTC.Height = pictureBoxPC.Height;
+            webViewRTC.Anchor = pictureBoxPC.Anchor;
+
+            this.Controls.Add(webViewRTC);
+            webViewRTC.BringToFront();
+        }
+
+        private void ActualizarEstadoSistema(string texto)
+        {
+            try
+            {
+                if (lblEstadoSistema == null) return;
+
+                if (lblEstadoSistema.InvokeRequired)
+                {
+                    lblEstadoSistema.BeginInvoke(new Action(() => lblEstadoSistema.Text = texto));
+                }
+                else
+                {
+                    lblEstadoSistema.Text = texto;
+                }
+            }
+            catch { }
+        }
+
+        private void ActualizarEstadoMqtt(string texto, Color color)
+        {
+            ActualizarLabelEstado(lblEstadoMqtt, texto, color);
+        }
+
+        private void ActualizarEstadoVoz(string texto, Color color)
+        {
+            ActualizarLabelEstado(lblEstadoVoz, texto, color);
+        }
+
+        private void ActualizarEstadoModo(string texto)
+        {
+            ActualizarLabelEstado(lblEstadoModo, texto, Color.FromArgb(180, 220, 255));
+        }
+
+        private void ActualizarLabelEstado(Label label, string texto, Color color)
+        {
+            try
+            {
+                if (label == null) return;
+
+                if (label.InvokeRequired)
+                {
+                    label.BeginInvoke(new Action(() =>
+                    {
+                        label.Text = texto;
+                        label.ForeColor = color;
+                    }));
+                }
+                else
+                {
+                    label.Text = texto;
+                    label.ForeColor = color;
+                }
+            }
+            catch { }
+        }
+
+        private void ActualizarUltimoGesto(string gesto)
+        {
+            try
+            {
+                if (lblUltimoGesto == null) return;
+
+                string texto = "Últim gest: " + gesto;
+
+                if (lblUltimoGesto.InvokeRequired)
+                    lblUltimoGesto.BeginInvoke(new Action(() => lblUltimoGesto.Text = texto));
+                else
+                    lblUltimoGesto.Text = texto;
+            }
+            catch { }
+        }
+
+        // =========================================================
+        //                       VOZ
+        // =========================================================
+
+        private void InicializarReconocimientoVoz()
+        {
+            if (vozActiva)
+                return;
+
+            try
+            {
+                try
+                {
+                    recognizer = new SpeechRecognitionEngine(new CultureInfo("es-ES"));
+                }
+                catch
+                {
+                    recognizer = new SpeechRecognitionEngine();
+                }
+
+                Choices commands = new Choices();
+                commands.Add(Conversacion.ObtenerFrasesReconocibles());
+
+                GrammarBuilder gb = new GrammarBuilder();
+                gb.Culture = recognizer.RecognizerInfo.Culture;
+                gb.Append(commands);
+
+                Grammar grammar = new Grammar(gb);
+                grammar.Name = "ComandosControlados";
+                recognizer.LoadGrammar(grammar);
+
+                // Apoyo para frases no exactas. Si te da problemas, puedes comentar este bloque.
+                try
+                {
+                    DictationGrammar dictado = new DictationGrammar();
+                    dictado.Name = "DictadoLibre";
+                    recognizer.LoadGrammar(dictado);
+                }
+                catch
+                {
+                    // No todos los equipos tienen dictado disponible para es-ES.
+                }
+
+                recognizer.SpeechRecognized += Recognizer_SpeechRecognized;
+                recognizer.SpeechRecognitionRejected += Recognizer_SpeechRecognitionRejected;
+
+                recognizer.SetInputToDefaultAudioDevice();
+                recognizer.RecognizeAsync(RecognizeMode.Multiple);
+
+                vozActiva = true;
+                ActualizarBotonVoz(true);
+
+                AñadirLog("[OK] Reconocimiento de voz iniciado.");
+                ActualizarEstadoVoz("Voz: activa", Color.FromArgb(0, 230, 180));
+                Hablar("Reconocimiento de voz activado.");
+            }
+            catch (Exception ex)
+            {
+                vozActiva = false;
+                ActualizarBotonVoz(false);
+                AñadirLog("[ERROR] Voz: " + ex.Message);
+                ActualizarEstadoVoz("Voz: error", Color.FromArgb(255, 82, 82));
+            }
+        }
+
+        private void DesactivarReconocimientoVoz()
+        {
+            try
+            {
+                vozActiva = false;
+                LimpiarConfirmacionPendiente();
+
+                if (recognizer != null)
+                {
+                    try { recognizer.RecognizeAsyncCancel(); } catch { }
+                    try { recognizer.RecognizeAsyncStop(); } catch { }
+                    try { recognizer.Dispose(); } catch { }
+                    recognizer = null;
+                }
+
+                AñadirLog("[INFO] Reconocimiento de voz desactivado.");
+                ActualizarEstadoVoz("Voz: desactivada", Color.FromArgb(255, 213, 79));
+                ActualizarBotonVoz(false);
+
+                if (voz != null)
+                    voz.SpeakAsyncCancelAll();
+            }
+            catch (Exception ex)
+            {
+                AñadirLog("[ERROR] Desactivar voz: " + ex.Message);
+            }
+        }
+
+        private void ActualizarBotonVoz(bool activa)
+        {
+            try
+            {
+                if (btnVoz == null) return;
+
+                if (btnVoz.InvokeRequired)
+                {
+                    btnVoz.BeginInvoke(new Action(() => ActualizarBotonVoz(activa)));
+                    return;
+                }
+
+                btnVoz.Text = activa ? "Desactivar voz" : "Activar voz";
+                btnVoz.BackColor = activa
+                    ? Color.FromArgb(198, 40, 40)
+                    : Color.FromArgb(57, 73, 171);
+            }
+            catch { }
+        }
+
+        private void btnVoz_Click(object sender, EventArgs e)
+        {
+            if (vozActiva)
+            {
+                DesactivarReconocimientoVoz();
+            }
+            else
+            {
+                InicializarReconocimientoVoz();
+            }
+        }
+
+        private void Hablar(string texto)
+        {
+            try
+            {
+                if (voz == null)
+                    return;
+
+                hablando = true;
+                voz.SpeakAsyncCancelAll();
+                voz.SpeakAsync(texto);
+            }
+            catch
+            {
+                hablando = false;
+            }
+        }
+
+        private void Voz_SpeakCompleted(object sender, SpeakCompletedEventArgs e)
+        {
+            hablando = false;
+        }
+
+        private void Recognizer_SpeechRecognitionRejected(object sender, SpeechRecognitionRejectedEventArgs e)
+        {
+            if (!vozActiva)
+                return;
+
+            try
+            {
+                this.BeginInvoke((MethodInvoker)delegate
+                {
+                    ActualizarEstadoSistema("Voz: orden no reconocida");
+                });
+            }
+            catch { }
+        }
+
+        private void Recognizer_SpeechRecognized(object sender, SpeechRecognizedEventArgs e)
+        {
+            if (!vozActiva || hablando)
+                return;
+
+            string frase = e.Result.Text;
+            float confianza = (float)e.Result.Confidence;
+            string nombreGramatica = e.Result.Grammar != null ? e.Result.Grammar.Name : "";
+
+            try
+            {
+                this.BeginInvoke((MethodInvoker)delegate
+                {
+                    float confianzaMinima = nombreGramatica == "ComandosControlados"
+                        ? CONFIANZA_MINIMA_COMANDO
+                        : CONFIANZA_MINIMA_DICTADO;
+
+                    AñadirLog("[VOZ] " + frase + " | confianza: " + confianza.ToString("F2") + " | " + nombreGramatica);
+
+                    if (confianza < confianzaMinima)
+                    {
+                        AñadirLog("[VOZ] Ignorado por baja confianza.");
+                        return;
+                    }
+
+                    if (frase == ultimaFrase &&
+                        (DateTime.Now - ultimaFraseTiempo).TotalMilliseconds < 1200)
+                    {
+                        return;
+                    }
+
+                    ultimaFrase = frase;
+                    ultimaFraseTiempo = DateTime.Now;
+
+                    ProcesarOrdenVoz(frase);
+                });
+            }
+            catch { }
+        }
+
+        private void ProcesarOrdenVoz(string frase)
+        {
+            if (esperandoConfirmacion)
+            {
+                if (Conversacion.EsRespuestaConfirmacion(frase))
+                {
+                    Hablar("Confirmado.");
+                    EjecutarAccion(ordenPendienteConfirmacion);
+                    LimpiarConfirmacionPendiente();
+                    return;
+                }
+
+                if (Conversacion.EsRespuestaCancelacion(frase))
+                {
+                    Hablar("Cancelado.");
+                    LimpiarConfirmacionPendiente();
+                    return;
+                }
+
+                Hablar("Responde sí para confirmar o no para cancelar.");
+                return;
+            }
+
+            ResultadoConversacion resultado = Conversacion.Interpretar(frase);
+
+            if (resultado.Accion == "confirmar" || resultado.Accion == "cancelar")
+            {
+                Hablar("No hay ninguna orden pendiente.");
+                return;
+            }
+
+            if (resultado.Accion == "ninguna")
+            {
+                Hablar(resultado.Mensaje);
+                return;
+            }
+
+            if (!resultado.ComandoCompleto)
+            {
+                Hablar(resultado.Mensaje);
+                return;
+            }
+
+            if (resultado.RequiereConfirmacion)
+            {
+                esperandoConfirmacion = true;
+                ordenPendienteConfirmacion = resultado;
+                Hablar(resultado.Mensaje);
+                return;
+            }
+
+            Hablar(resultado.Mensaje);
+            EjecutarAccion(resultado);
+        }
+
+        private void LimpiarConfirmacionPendiente()
+        {
+            esperandoConfirmacion = false;
+            ordenPendienteConfirmacion = null;
+        }
+
+        private void EjecutarAccion(ResultadoConversacion resultado)
+        {
+            if (resultado == null)
+            {
+                Hablar("No hay ninguna acción pendiente.");
+                return;
+            }
+
+            switch (resultado.Accion)
+            {
+                case "conectar":
+                    button1.PerformClick();
+                    break;
+
+                case "despegar":
+                    button2.PerformClick();
+                    break;
+
+                case "aterrizar":
+                    button3.PerformClick();
+                    break;
+
+                case "girar":
+                    EjecutarGiro(resultado.Sentido, resultado.Grados);
+                    break;
+
+                case "avanzar":
+                    EjecutarAvance(resultado.Metros);
+                    break;
+
+                case "subir":
+                    EjecutarMovimientoVertical("Up", "Subiendo.");
+                    break;
+
+                case "bajar":
+                    EjecutarMovimientoVertical("Down", "Bajando.");
+                    break;
+
+                case "gestos":
+                    btnGestos.PerformClick();
+                    break;
+
+                case "objetos":
+                    btnObjetos.PerformClick();
+                    break;
+
+                case "detener":
+                    btnDetener.PerformClick();
+                    break;
+
+                default:
+                    Hablar("Acción no reconocida.");
+                    break;
+            }
+        }
+
+        private void EjecutarGiro(string sentido, int? grados)
+        {
+            if (grados == null || string.IsNullOrEmpty(sentido))
+            {
+                Hablar("No se puede girar porque faltan grados o sentido.");
+                return;
+            }
+
+            try
+            {
+                int heading;
+
+                if (sentido == "derecha")
+                    heading = grados.Value % 360;
+                else
+                    heading = (360 - grados.Value) % 360;
+
+                miDron.CambiarHeading(heading, bloquear: false);
+                AñadirLog("[VOZ] Girando " + grados.Value + " grados a la " + sentido + ".");
+            }
+            catch (Exception ex)
+            {
+                AñadirLog("[ERROR] Giro voz: " + ex.Message);
+                Hablar("No he podido girar. Revisa que el dron esté conectado.");
+            }
+        }
+
+        private bool EjecutarAvance(int? metros)
+        {
+            if (metros == null)
+            {
+                Hablar("No se puede avanzar porque faltan los metros.");
+                return false;
+            }
+
+            try
+            {
+                miDron.Mover("Forward", metros.Value, bloquear: false);
+                AñadirLog("[VOZ] Avanzando " + metros.Value + " metros.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AñadirLog("[ERROR] Avance voz: " + ex.Message);
+                Hablar("No he podido avanzar. Revisa que el dron esté conectado.");
+                return false;
+            }
+        }
+
+        private void EjecutarMovimientoVertical(string direccion, string mensaje)
+        {
+            try
+            {
+                miDron.Mover(direccion, 2, bloquear: false);
+                AñadirLog("[VOZ] " + mensaje);
+            }
+            catch (Exception ex)
+            {
+                AñadirLog("[ERROR] Movimiento vertical voz: " + ex.Message);
+                Hablar("No he podido ejecutar el movimiento.");
             }
         }
 
@@ -92,13 +589,13 @@ namespace WindowsFormsApp1
 
         private string GetProjectRoot()
         {
-            // ...\TFG-Reconocimiento_de_objetos2\WindowsFormsApp1
+            // ...\TFG-App\WindowsFormsApp1
             return Path.GetFullPath(Path.Combine(Application.StartupPath, @"..\..\.."));
         }
 
         private string GetRepoRoot()
         {
-            // ...\TFG-Reconocimiento_de_objetos2
+            // ...\TFG-App
             return Path.GetFullPath(Path.Combine(Application.StartupPath, @"..\..\..\.."));
         }
 
@@ -269,7 +766,7 @@ namespace WindowsFormsApp1
             {
                 if (t.nombre == "Alt")
                 {
-                    altLbl.Text = t.valor.ToString();
+                    altLbl.Text = t.valor.ToString("0.00");
                     break;
                 }
             }
@@ -284,6 +781,7 @@ namespace WindowsFormsApp1
             try
             {
                 AñadirLog("[INFO] Intentando conectar al dron en modo simulacion...");
+                ActualizarEstadoSistema("Sistema: conectando dron");
                 miDron.Conectar("simulacion");
                 AñadirLog("[OK] Conexión solicitada al dron.");
 
@@ -297,16 +795,24 @@ namespace WindowsFormsApp1
                 if (webRtcOk)
                 {
                     AñadirLog("[OK] Server y publisher preparados.");
+                    ActualizarEstadoSistema("Sistema: dron conectado + vídeo activo");
+
+                    if (webViewRTC.CoreWebView2 == null)
+                        await webViewRTC.EnsureCoreWebView2Async();
+
                     webViewRTC.Source = new Uri("http://localhost:8080/");
                 }
                 else
                 {
                     AñadirLog("[ERROR] No se pudo preparar server/publisher.");
+                    ActualizarEstadoSistema("Sistema: error en vídeo");
                 }
             }
             catch (Exception ex)
             {
                 AñadirLog("[ERROR] Conectar: " + ex.Message);
+                Hablar("No he podido conectar con el dron.");
+                ActualizarEstadoSistema("Sistema: error al conectar");
             }
         }
 
@@ -316,9 +822,20 @@ namespace WindowsFormsApp1
 
         private void EnAire(byte id, object param)
         {
-            button2.BackColor = Color.Green;
-            button2.ForeColor = Color.White;
-            button2.Text = (string)param;
+            try
+            {
+                if (button2.InvokeRequired)
+                {
+                    button2.BeginInvoke(new Action(() => EnAire(id, param)));
+                    return;
+                }
+
+                button2.BackColor = Color.Green;
+                button2.ForeColor = Color.White;
+                button2.Text = (string)param;
+                ActualizarEstadoSistema("Sistema: dron en aire");
+            }
+            catch { }
         }
 
         private void button2_Click(object sender, EventArgs e)
@@ -327,10 +844,13 @@ namespace WindowsFormsApp1
             {
                 miDron.Despegar(20, bloquear: false, f: EnAire, param: "Volando");
                 button2.BackColor = Color.Yellow;
+                button2.ForeColor = Color.Black;
+                AñadirLog("[INFO] Despegando.");
             }
             catch (Exception ex)
             {
                 AñadirLog("[ERROR] Despegar: " + ex.Message);
+                Hablar("No he podido despegar. Revisa que el dron esté conectado.");
             }
         }
 
@@ -339,10 +859,13 @@ namespace WindowsFormsApp1
             try
             {
                 miDron.Aterrizar(bloquear: false);
+                AñadirLog("[INFO] Aterrizando.");
+                ActualizarEstadoSistema("Sistema: aterrizando");
             }
             catch (Exception ex)
             {
                 AñadirLog("[ERROR] Aterrizar: " + ex.Message);
+                Hablar("No he podido aterrizar.");
             }
         }
 
@@ -365,12 +888,20 @@ namespace WindowsFormsApp1
                 {
                     mqttConnected = true;
                     AñadirLog("MQTT connectat al broker.");
+                    ActualizarEstadoMqtt("MQTT: connectat", Color.FromArgb(0, 230, 180));
 
                     await mqttClient.SubscribeAsync("gestos");
                     AñadirLog("Subscrita al tema 'gestos'.");
 
                     await mqttClient.SubscribeAsync("objetos");
                     AñadirLog("Subscrita al tema 'objetos'.");
+                });
+
+                mqttClient.UseDisconnectedHandler(e =>
+                {
+                    mqttConnected = false;
+                    AñadirLog("MQTT desconnectat.");
+                    ActualizarEstadoMqtt("MQTT: desconnectat", Color.FromArgb(255, 82, 82));
                 });
 
                 mqttClient.UseApplicationMessageReceivedHandler(e =>
@@ -394,6 +925,7 @@ namespace WindowsFormsApp1
             catch (Exception ex)
             {
                 AñadirLog("❌ Error connectant MQTT: " + ex.Message);
+                ActualizarEstadoMqtt("MQTT: error", Color.FromArgb(255, 82, 82));
             }
         }
 
@@ -659,6 +1191,7 @@ namespace WindowsFormsApp1
                 modoObjetosActivo = false;
 
                 AñadirLog("[INFO] Cargando reconocimiento de gestos...");
+                ActualizarEstadoModo("Modo: gestos");
 
                 // Ya NO iniciamos server.py ni publisher aquí.
                 // Solo comprobamos que el stream exista.
@@ -725,6 +1258,8 @@ namespace WindowsFormsApp1
         {
             try
             {
+                ActualizarUltimoGesto(gesto);
+
                 switch (gesto.ToLower())
                 {
                     case "palm":
@@ -732,6 +1267,8 @@ namespace WindowsFormsApp1
                         break;
 
                     case "puño":
+                    case "punyo":
+                    case "puno":
                         miDron.Aterrizar(bloquear: false);
                         break;
 
@@ -773,6 +1310,7 @@ namespace WindowsFormsApp1
                 modoObjetosActivo = true;
 
                 AñadirLog("[INFO] Cargando reconocimiento de objetos...");
+                ActualizarEstadoModo("Modo: objetos");
 
                 // Ya NO iniciamos server.py ni publisher aquí.
                 // Solo comprobamos que el stream exista.
@@ -838,13 +1376,249 @@ namespace WindowsFormsApp1
                 modoGestosActivo = false;
                 modoObjetosActivo = false;
 
-                webViewRTC.Source = new Uri("about:blank");
+                if (webViewRTC != null)
+                    webViewRTC.Source = new Uri("about:blank");
+
+                ActualizarEstadoModo("Modo: detenido");
+                ActualizarEstadoSistema("Sistema: scripts detenidos");
 
                 AñadirLog("[INFO] Todos los scripts detenidos.");
             }
             catch (Exception ex)
             {
                 AñadirLog("[ERROR] btnDetener_Click: " + ex.Message);
+            }
+        }
+
+
+        // =========================================================
+        //              CAPTURA JPG Y GRABACIÓN WEBM
+        // =========================================================
+
+        private string GetCarpetaMultimedia()
+        {
+            // Guardem captures JPG i vídeos WEBM directament a Descargas.
+            string carpeta = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads"
+            );
+
+            Directory.CreateDirectory(carpeta);
+            return carpeta;
+        }
+
+        private async void btnCaptura_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (webViewRTC == null)
+                {
+                    AñadirLog("[ERROR] No existe el visor WebView2.");
+                    return;
+                }
+
+                if (webViewRTC.CoreWebView2 == null)
+                    await webViewRTC.EnsureCoreWebView2Async();
+
+                string carpeta = GetCarpetaMultimedia();
+                string rutaCaptura = Path.Combine(
+                    carpeta,
+                    "captura_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".jpg"
+                );
+
+                using (FileStream fs = new FileStream(rutaCaptura, FileMode.Create, FileAccess.Write))
+                {
+                    await webViewRTC.CoreWebView2.CapturePreviewAsync(
+                        CoreWebView2CapturePreviewImageFormat.Jpeg,
+                        fs
+                    );
+                }
+
+                AñadirLog("[OK] Captura JPG guardada en Descargas: " + rutaCaptura);
+            }
+            catch (Exception ex)
+            {
+                AñadirLog("[ERROR] Captura JPG: " + ex.Message);
+            }
+        }
+
+        private async void btnGrabarVideo_Click(object sender, EventArgs e)
+        {
+            if (grabandoVideo)
+            {
+                AñadirLog("[INFO] Ya hay una grabación en curso.");
+                return;
+            }
+
+            try
+            {
+                int segundos = (int)numSegundosVideo.Value;
+
+                if (webViewRTC == null)
+                {
+                    AñadirLog("[ERROR] No existe el visor WebView2.");
+                    return;
+                }
+
+                if (webViewRTC.CoreWebView2 == null)
+                    await webViewRTC.EnsureCoreWebView2Async();
+
+                string carpeta = GetCarpetaMultimedia();
+                string nombreArchivo = "video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".webm";
+                string rutaVideo = Path.Combine(carpeta, nombreArchivo);
+
+                rutaDescargaWebmPendiente = rutaVideo;
+                grabandoVideo = true;
+                btnGrabarVideo.Enabled = false;
+                btnGrabarVideo.Text = "Grabando...";
+
+                AñadirLog("[INFO] Iniciando grabación WEBM de " + segundos + " segundos...");
+
+                string resultado = await GrabarWebView2WebmAsync(segundos, nombreArchivo);
+
+                if (resultado == "OK")
+                {
+                    AñadirLog("[OK] Vídeo WEBM guardado en Descargas: " + rutaVideo);
+                }
+                else
+                {
+                    rutaDescargaWebmPendiente = null;
+                    AñadirLog("[ERROR] Grabación WEBM: " + resultado);
+                }
+            }
+            catch (Exception ex)
+            {
+                rutaDescargaWebmPendiente = null;
+                AñadirLog("[ERROR] Grabación WEBM: " + ex.Message);
+            }
+            finally
+            {
+                grabandoVideo = false;
+                btnGrabarVideo.Enabled = true;
+                btnGrabarVideo.Text = "Grabar";
+            }
+        }
+
+        private async Task<string> GrabarWebView2WebmAsync(int segundos, string nombreArchivo)
+        {
+            string nombreSeguro = nombreArchivo.Replace("\\", "\\\\").Replace("'", "\\'");
+
+            string script = @"
+                (async function() {
+                    try {
+                        const video = document.querySelector('video');
+                        const img = document.querySelector('img');
+
+                        let stream = null;
+                        let intervaloCanvas = null;
+
+                        if (video && video.readyState >= 2) {
+                            stream = video.captureStream
+                                ? video.captureStream()
+                                : (video.mozCaptureStream ? video.mozCaptureStream() : null);
+                        }
+                        else if (img) {
+                            const ancho = img.naturalWidth || img.clientWidth || 640;
+                            const alto = img.naturalHeight || img.clientHeight || 480;
+
+                            const canvas = document.createElement('canvas');
+                            canvas.width = ancho;
+                            canvas.height = alto;
+
+                            const ctx = canvas.getContext('2d');
+
+                            intervaloCanvas = setInterval(function() {
+                                try {
+                                    ctx.drawImage(img, 0, 0, ancho, alto);
+                                } catch (e) { }
+                            }, 50);
+
+                            stream = canvas.captureStream(20);
+                        }
+                        else {
+                            return 'No se ha encontrado ningún elemento <video> ni <img> para grabar.';
+                        }
+
+                        if (!stream) {
+                            return 'El navegador no permite capturar el stream actual.';
+                        }
+
+                        const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+                            ? 'video/webm;codecs=vp8'
+                            : 'video/webm';
+
+                        const chunks = [];
+                        const recorder = new MediaRecorder(stream, { mimeType: mimeType });
+
+                        recorder.ondataavailable = function(e) {
+                            if (e.data && e.data.size > 0) {
+                                chunks.push(e.data);
+                            }
+                        };
+
+                        const stopped = new Promise(resolve => {
+                            recorder.onstop = resolve;
+                        });
+
+                        recorder.start(250);
+                        await new Promise(resolve => setTimeout(resolve, " + segundos.ToString(System.Globalization.CultureInfo.InvariantCulture) + @" * 1000));
+                        recorder.stop();
+                        await stopped;
+
+                        if (intervaloCanvas) {
+                            clearInterval(intervaloCanvas);
+                        }
+
+                        const blob = new Blob(chunks, { type: 'video/webm' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = '" + nombreSeguro + @"';
+                        document.body.appendChild(a);
+                        a.click();
+
+                        setTimeout(function() {
+                            URL.revokeObjectURL(url);
+                            a.remove();
+                        }, 1000);
+
+                        return 'OK';
+                    } catch (err) {
+                        return err.message;
+                    }
+                })();";
+
+            string resultadoJson = await webViewRTC.CoreWebView2.ExecuteScriptAsync(script);
+            return DecodificarResultadoJavascript(resultadoJson);
+        }
+
+        private string DecodificarResultadoJavascript(string resultadoJson)
+        {
+            if (string.IsNullOrWhiteSpace(resultadoJson))
+                return "Sin respuesta del navegador.";
+
+            string resultado = resultadoJson.Trim();
+
+            if (resultado.StartsWith("\"") && resultado.EndsWith("\""))
+                resultado = resultado.Substring(1, resultado.Length - 2);
+
+            return System.Text.RegularExpressions.Regex.Unescape(resultado);
+        }
+
+        private void WebViewRTC_DownloadStarting(object sender, CoreWebView2DownloadStartingEventArgs e)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(rutaDescargaWebmPendiente))
+                {
+                    e.ResultFilePath = rutaDescargaWebmPendiente;
+                    AñadirLog("[INFO] Descarga WEBM dirigida a: " + rutaDescargaWebmPendiente);
+                    rutaDescargaWebmPendiente = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                AñadirLog("[ERROR] DownloadStarting WEBM: " + ex.Message);
             }
         }
 
@@ -876,6 +1650,27 @@ namespace WindowsFormsApp1
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            vozActiva = false;
+
+            try
+            {
+                if (recognizer != null)
+                {
+                    recognizer.RecognizeAsyncCancel();
+                    recognizer.RecognizeAsyncStop();
+                    recognizer.Dispose();
+                    recognizer = null;
+                }
+
+                if (voz != null)
+                {
+                    voz.SpeakAsyncCancelAll();
+                    voz.Dispose();
+                    voz = null;
+                }
+            }
+            catch { }
+
             try
             {
                 if (mqttClient != null && mqttConnected)
@@ -889,6 +1684,16 @@ namespace WindowsFormsApp1
             DetenerProceso(ref webrtcServerProcess, "server.py");
 
             base.OnFormClosing(e);
+        }
+
+        private void lblAltitudTitulo_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void lblLeyendaGestos_Click(object sender, EventArgs e)
+        {
+
         }
     }
 }
