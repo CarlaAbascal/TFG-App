@@ -185,7 +185,7 @@ namespace WindowsFormsApp1
             {
                 if (lblUltimoGesto == null) return;
 
-                string texto = "Últim gest: " + gesto;
+                string texto = "Último gesto: " + gesto;
 
                 if (lblUltimoGesto.InvokeRequired)
                     lblUltimoGesto.BeginInvoke(new Action(() => lblUltimoGesto.Text = texto));
@@ -887,8 +887,8 @@ namespace WindowsFormsApp1
                 mqttClient.UseConnectedHandler(async e =>
                 {
                     mqttConnected = true;
-                    AñadirLog("MQTT connectat al broker.");
-                    ActualizarEstadoMqtt("MQTT: connectat", Color.FromArgb(0, 230, 180));
+                    AñadirLog("MQTT conectado al broker.");
+                    ActualizarEstadoMqtt("MQTT: conectado", Color.FromArgb(0, 230, 180));
 
                     await mqttClient.SubscribeAsync("gestos");
                     AñadirLog("Subscrita al tema 'gestos'.");
@@ -900,8 +900,8 @@ namespace WindowsFormsApp1
                 mqttClient.UseDisconnectedHandler(e =>
                 {
                     mqttConnected = false;
-                    AñadirLog("MQTT desconnectat.");
-                    ActualizarEstadoMqtt("MQTT: desconnectat", Color.FromArgb(255, 82, 82));
+                    AñadirLog("MQTT desconectado.");
+                    ActualizarEstadoMqtt("MQTT: desconectado", Color.FromArgb(255, 82, 82));
                 });
 
                 mqttClient.UseApplicationMessageReceivedHandler(e =>
@@ -911,7 +911,7 @@ namespace WindowsFormsApp1
 
                     if (topic == "gestos")
                     {
-                        AñadirLog("Gesto rebut per MQTT: " + mensaje);
+                        AñadirLog("Gesto recibido por MQTT: " + mensaje);
                         EjecutarAccionPorGesto(mensaje);
                     }
                     else if (topic == "objetos")
@@ -924,7 +924,7 @@ namespace WindowsFormsApp1
             }
             catch (Exception ex)
             {
-                AñadirLog("❌ Error connectant MQTT: " + ex.Message);
+                AñadirLog("❌ Error connectando MQTT: " + ex.Message);
                 ActualizarEstadoMqtt("MQTT: error", Color.FromArgb(255, 82, 82));
             }
         }
@@ -1622,27 +1622,7 @@ namespace WindowsFormsApp1
             }
         }
 
-        // =========================================================
-        //                       BOTÓN COPIAR LOG
-        // =========================================================
-
-        private void btnCopiarLog_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                StringBuilder sb = new StringBuilder();
-
-                foreach (var item in listBox1.Items)
-                    sb.AppendLine(item.ToString());
-
-                Clipboard.SetText(sb.ToString());
-                MessageBox.Show("Log copiat al porta-retalls.");
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Error copiando log: " + ex.Message);
-            }
-        }
+        
 
         // =========================================================
         //                       FORM CLOSING
@@ -1692,6 +1672,16 @@ namespace WindowsFormsApp1
         }
 
         private void lblLeyendaGestos_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void lblTituloApp_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void Form1_Load_1(object sender, EventArgs e)
         {
 
         }
