@@ -2,6 +2,16 @@
 
 
 
+\--------Versión 2.0---------
+
+
+
+Diseño y funcionamiento -- OK
+
+
+
+
+
 \--------Versión 1.1---------
 
 
@@ -20,7 +30,7 @@ Captura imagen (jpg)
 
 
 
-Leyenda de gestos 
+Leyenda de gestos
 
 Palm → Despegar
 
